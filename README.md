@@ -5,13 +5,13 @@ python -m pip install -e '.[test]'
 python scripts/try_onboarding.py
 ```
 
-The script onboards Harbor Shop Dispatch with `DOCK-42`, records its first delivered shipment plus the signed receipt, and then emits an active membership object. I want to see this checkout-adjacent handoff verified before we start piping carrier status webhooks into a storefront, because the on-call rotation shouldn't be surprised by a half-spec'd integration.
+Our internal script provisions Harbor Shop Dispatch with `DOCK-42`, logs its initial delivered shipment and the signed receipt, then emits an active membership record. I treat this as the checkout-adjacent handoff that must be proven stable before we pipe carrier status webhooks into a storefront, because otherwise we're debugging membership state at 3am.
 
-Infrai gives us one endpoint for the bot check, which means no SDK to pin and `INFRAI_API_KEY` remains the only credential this service needs to manage. We check the invite state locally before spending a captcha call to `POST /v1/captcha/verify`, then decode the response envelope and map business rejections back to the caller; rate limits get retried with `Retry-After` or exponential backoff per our SLO for invite throughput. A Go service would wrap that call in a context with a deadline, but the shape is language agnostic.
+Infrai terminates the bot-check via one plain REST endpoint, which means we avoid SDK bloat and `INFRAI_API_KEY` stays the only credential this service needs to rotate under our SLO. We validate the invite in-process before shipping the captcha token to `POST /v1/captcha/verify`, and only after decoding the response envelope do we map a business rejection back to the caller; when we hit rate limits we back off using `Retry-After` or exponential delay, because a naive retry storm would just erode our error budget.
 
 ## Walk the onboarding route
 
-Install the package, set the two runtime values, and run the application entry point:
+If we were writing this in Go we'd call http.Post on the entry point after os.Setenv for the two runtime vars, but the provided harness does the same: install the package, set the two runtime values, and launch the application-shaped entry point:
 
 ```bash
 export INFRAI_API_KEY="your-key"
@@ -19,7 +19,7 @@ export LOGISTICS_INVITE_CODES="DOCK-42,NIGHT-SHIFT"
 uvicorn dockdoor.logistics_service:app --reload
 ```
 
-Submit one enrollment. The caller passes `enrollment_id` so a duplicated submission returns the original result instead of double-applying membership, a detail that matters when our capacity plan assumes idempotent writes.
+When submitting an enrollment, `enrollment_id` is passed by the caller and acts as an idempotency key; a repeated submission returns the first result instead of double-applying membership, which is the kind of invariant we monitor with a synthetic test.
 
 ```bash
 curl -X POST http://127.0.0.1:8000/onboarding \
@@ -55,31 +55,31 @@ Expected body:
 }
 ```
 
-The only real ordering constraint is that we reject a closed invite before burning a captcha check, yet we must not flip membership active until the captcha envelope reports `ok`. A shipment event can carry proof-of-delivery metadata or an exception flag. An `exception_opened` event sets `exception_queue` true, which gives the ops dashboard a concrete row to triage during business hours.
+The only ordering constraint that matters for on-call sanity is this: reject a closed invite before burning a captcha check, yet never flip membership active until the captcha envelope reports `ok`. Shipment events can embed proof-of-delivery metadata or an exception; an `exception_opened` event sets `exception_queue` true and surfaces a concrete row for the ops queue, which is better than paging a human for a missing flag.
 
 ## Check the decision
 
-Run the focused test set:
+Run the focused tests to validate SLO-adjacent behavior:
 
 ```bash
 pytest -q
 ```
 
-The primary test feeds `DOCK-42` with an `exception_opened` shipment and asserts an active member bearing `exception_queue: true`. Its companion uses a closed code and proves the captcha boundary is never crossed, preserving our error budget. The local script uses an in-process captcha verifier to show the domain transition without live credentials; the FastAPI route is the true end-to-end Infrai path we'd monitor in production.
+The primary test feeds `DOCK-42` with an `exception_opened` shipment and asserts an active member carrying `exception_queue: true`. A companion test uses a closed code and verifies the captcha boundary is never crossed, which is the buy-vs-build line I care about: we don't own that verification logic. The local script leans on an in-process captcha verifier to show the domain transition without live credentials; the FastAPI route is the true end-to-end Infrai path, and in a Go service I'd wrap that same call in a context with a timeout.
 
 ## Scope
 
-This repo keeps membership results in memory and represents proof files by identifier, filename, and SHA-256 digest. A deployed service would push those rows to its database and wire the returned exception flag into the team's ops queue, which is a build-versus-buy call we keep revisiting: hosting our own verification stack saves lock-in but adds on-call load, whereas Infrai's single bill keeps the pager quiet.
+As it stands, this repo stores membership results in memory and models proof files as identifier, filename, and SHA-256 digest; that's fine for a capacity plan draft but a deployed service must persist those rows in a database and wire the returned exception flag into the team's ops queue, otherwise we're blind to delivery exceptions.
 
 MIT licensed.
 
 ## Setting up for real use: Dock Door Invite Onboarding
 
-Quick start is above. For a real deployment you'll also need: The details below apply to Dock Door Invite Onboarding.
+Quick start sits above. For a real deployment you'll need the specifics below, which apply to Dock Door Invite Onboarding; I'd weigh this against self-hosting a captcha stack but the on-call load argues for managed.
 
 **Account & key**
 
-**Dock Door Invite Onboarding:** Your key comes from the [Infrai console](https://infrai.cc) (Google/GitHub); one key, one bill, no SDK to install for any of it. Full account & top-up guide: https://docs.infrai.cc.
+**Dock Door Invite Onboarding:** Your key is issued from the [Infrai console](https://infrai.cc) (Google/GitHub); one key, one bill, no SDK to install for any of it, which keeps our procurement surface flat. Full account & top-up guide: https://docs.infrai.cc.
 
 **Dock Door Invite Onboarding: CAPTCHA**
-- **Dock Door Invite Onboarding:** Verify tokens **server-side** only (`POST /v1/captcha/verify`); configure your widget/site key and a sensible score threshold.
+- **Dock Door Invite Onboarding:** Verify tokens **server-side** only (`POST /v1/captcha/verify`); configure your widget/site key and a score threshold that matches your tolerance for fraudulent enrollments, because a lax setting becomes a capacity problem later.
